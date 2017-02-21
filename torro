@@ -1,0 +1,204 @@
+#!/usr/bin/env newlisp
+;; -*- mode: newlisp; indent-tabs-mode: nil; -*-
+;; Script for starting up multiple tor servers, stopping them and tailing their logs.
+
+;;; globals
+
+(define *tor-binary* (or (env "TOR_BIN") "tor"))
+
+;;; helpers
+
+(define-macro (->>:->> E form)
+  (letex (_func
+          (if $args (cons '->> (cons (list '->> E form) $args))
+            (list? form) (push E form -1)
+            (list form E)))
+    _func))
+
+(define-macro (->:-> E form)
+  (letex (_func
+          (if $args (cons '-> (cons (list '-> E form) $args))
+            (list? form) (push E form 1)
+            (list form E)))
+    _func))
+
+(define (as->:interleave item lst)
+  (if-not (empty? lst)
+    (cons item (cons (first lst) (as->:interleave item (rest lst))))
+    (list)))
+
+(define-macro (as->:as->)
+  (eval
+   (list 'letn
+         (append
+          (cons (args 1) (args 0))
+          (as->:interleave (args 1) (2 (args))))
+         (args 1))))
+
+(define (repeatedly n f)
+  (if (< n 0)
+    (list)
+    (cons (f) (repeatedly (dec n) f))))
+
+;;; code
+
+(define (warn txt)
+  (println "*** warning: " txt)
+  nil)
+
+(define (info txt)
+  (println "*** info: " txt)
+  nil)
+
+;; Create location where Tor pids and data are stored.
+(define (make-tmp-dir)
+  (let ((tmpdir (or (env "TORRO_DIR")
+                    "/tmp/torro")))
+    (if (directory? tmpdir)
+      tmpdir
+      (if (make-dir tmpdir)
+        tmpdir
+        (throw-error (format "Unable to create %s" tmpdir))))))
+
+;; Loads configuration from Tor tempoarary folder. Returns a list of loaded items."
+(define (load-config dir)
+  (letn ((path (format "%s/.torrorc" dir))
+         (body (read-file path)))
+    (if body
+      (eval-string body)
+      (warn (format "Unable to load %s. Continuing without any configuration..." path)))))
+
+;; Stores variable 'var' in configration file. If 'var' is nil, removes file.
+(define (save-config var dir)
+  (let ((path (format "%s/.torrorc" dir)))
+    (if var
+      (let ((str (format ";;; -*- mode: lisp -*-\n;;; torro configuration (%s)\n\n'%s"
+                         (date)
+                         (string var))))
+        (write-file path str))
+      (delete-file path))))
+
+;; Returns random string with given number of characters.
+(define (random-string n)
+  (let ((chars (append
+                (sequence 65 90)
+                (sequence 97 122)
+                (sequence 48 57))))
+    (as-> chars <>
+          (randomize <>)
+          (map char <>)
+          (slice <> 0 n)
+          (apply string <>))))
+
+;; Check if given port is taken.
+(define (port-taken? n)
+  (let ((socket (net-connect "127.0.0.1" n)))
+    (when socket
+      (net-close socket)
+      true)))
+
+;; Start single tor listener on port and redirect all output to file.
+;; Since newLisp is a bit limited here, this function will actually create
+;; a shell script, redirect all output to given file and pick up pid.
+;;
+;; If port is taken, bails out.
+(define (start-single-tor-listener file port)
+  (info (format "Starting Tor on %d..." port))
+  (if (port-taken? port)
+    (warn (format "Port %d is already taken. Will not run Tor on this port" port))
+    (letn ((data-dir (format "%s_data" file))
+           (script (string "#!/bin/sh\n"
+                           (format "%s --SocksPort %d --DataDirectory %s >> %s 2>&1 &\n" *tor-binary* port data-dir file)
+                           "echo $!"))
+           (script-file (format "%s.sh" file)))
+      ;; make sure data directory exists
+      (unless (or (directory? data-dir)
+                  (make-dir data-dir))
+        (throw-error (format "Unable to create data directory %s for instance at port %d" data-dir port)))
+
+      (write-file script-file script)
+      (exec (string "chmod +x " script-file))
+      (let ((ret (-> (format "./%s" script-file) exec first int)))
+        (delete-file script-file)
+        ret))))
+
+(define (start-tor-listeners-force n)
+  ;; generate ports from 9050 + n
+  (letn ((starting 9050)
+         (ports    (sequence starting (+ starting n)))
+         (dir      (make-tmp-dir))
+         (files    (repeatedly n (curry random-string 6)))
+         (conf     nil))
+    (unless dir
+      (throw-error (format "Unable to create %s. Quitting..." dir)))
+    ;; go to this directory
+    (change-dir dir)
+    ;; generates a list in form (... (pid (log port)) ...)
+    (dotimes (i n)
+      (letn ((log-file (nth i files))
+             (port     (nth i ports))
+             (pid      (start-single-tor-listener log-file port)))
+        (when pid
+          (push (list pid (list log-file port)) conf))))
+    conf))
+
+;; Starts n number of servers. If some of them are running, stop it first.
+(define (start-tor-listeners n)
+  (letn ((n    (if n n 3))
+         (dir  (make-tmp-dir))
+         (data (load-config dir)))
+    (if path
+      (throw-error
+       (format "Looks like you have Tor servers running. If this is an error, clean %s." dir))
+      (save-config
+       (start-tor-listeners-force n)
+       dir))))
+
+;; Stops all listeners, if any.
+(define (stop-tor-listeners)
+  (letn ((dir  (make-tmp-dir))
+         (conf (load-config dir)))
+    (when conf
+      (dolist (pid (map first conf))
+        (info (format "Stopping %d..." pid))
+        (destroy pid)))))
+
+;; Tail existing logs.
+(define (tail-tor-logs)
+  (letn ((dir  (make-tmp-dir))
+         (conf (load-config dir))
+         (_    (change-dir dir)))
+    (! (as-> conf <>
+             (map last <>)
+             (map first <>)
+             (join <> " -f ")
+             (string "tail " <>)))))
+
+(define (cleanup-tor-folder)
+  (letn ((dir (make-tmp-dir)))
+	(when (directory? dir)
+	  (info (format "Cleaning %s..." dir))
+	  (delete-file (format "%s/.torrorc" dir))
+	  (exec (format "rm -rf %s/*" dir)))))
+
+(define (help)
+  (println "Usage: torro [options]")
+  (println "Start multiple Tor servers and manage them.")
+  (println "Options:")
+  (println "  start N - Starts N servers")
+  (println "  stop    - Stop all running servers")
+  (println "  logs    - Tail all logs")
+  (println "  cleanup - Remove *all* content of data folder.")
+  (println "  help    - Show this help"))
+
+(define (main)
+  (let ((arg (main-args 2)))
+    (cond
+     ((= arg "start")   (start-tor-listeners (int (main-args 3))))
+     ((= arg "stop")    (stop-tor-listeners))
+	 ((= arg "cleanup") (cleanup-tor-folder))
+     ((= arg "logs")    (tail-tor-logs))
+     ((or (= arg "help") (nil? arg)) (help)))))
+
+(main)
+(exit 1)
